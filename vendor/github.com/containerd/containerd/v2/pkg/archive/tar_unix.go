@@ -75,15 +75,39 @@ func open(p string) (*os.File, error) {
 	return os.Open(p)
 }
 
+// applyUmask holds the process umask, read once at Apply entry so that
+// openFile/mkdir can skip the compensating chmod when the mode would not
+// be masked (the common case: 0644 files / 0755 dirs with umask 022).
+// A value of 0 means "unknown"; chmod is then always applied.
+var applyUmask os.FileMode
+
+// setApplyUmask reads the current umask (and restores it — reading requires
+// a write) into applyUmask. Call once per Apply, before any goroutines run.
+func setApplyUmask() {
+	old := unix.Umask(0)
+	unix.Umask(old)
+	applyUmask = os.FileMode(old & 0777)
+}
+
+// permUnmaskedByUmask reports whether perm survives the umask unchanged,
+// meaning the chmod-after-open/mkdir compensation call is a no-op.
+func permUnmaskedByUmask(perm os.FileMode) bool {
+	return perm&^applyUmask == perm
+}
+
 func openFile(name string, flag int, perm os.FileMode) (*os.File, error) {
 	f, err := os.OpenFile(name, flag, perm)
 	if err != nil {
 		return nil, err
 	}
-	// Call chmod to avoid permission mask
-	if err := f.Chmod(perm); err != nil {
-		f.Close()
-		return nil, err
+	// Call chmod to avoid permission mask — but only when the umask would
+	// actually mask bits off perm. When perm survives umask unchanged the
+	// kernel already created the file with exactly perm.
+	if !permUnmaskedByUmask(perm) {
+		if err := f.Chmod(perm); err != nil {
+			f.Close()
+			return nil, err
+		}
 	}
 	return f, err
 }
@@ -94,7 +118,10 @@ func mkdir(path string, perm os.FileMode) error {
 	}
 	// Only final created directory gets explicit permission
 	// call to avoid permission mask
-	return os.Chmod(path, perm)
+	if !permUnmaskedByUmask(perm) {
+		return os.Chmod(path, perm)
+	}
+	return nil
 }
 
 func skipFile(hdr *tar.Header) bool {

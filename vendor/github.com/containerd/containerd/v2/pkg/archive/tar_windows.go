@@ -61,6 +61,15 @@ func openFile(name string, flag int, perm os.FileMode) (*os.File, error) {
 	return os.OpenFile(name, flag|windows.O_FILE_FLAG_SEQUENTIAL_SCAN, perm)
 }
 
+// setApplyUmask is a no-op on Windows: openFile/mkdir never consult
+// applyUmask here because permUnmaskedByUmask's fallback (unknown umask)
+// keeps the unconditional chmod behavior.
+func setApplyUmask() {}
+
+func permUnmaskedByUmask(os.FileMode) bool {
+	return false
+}
+
 func mkdir(path string, perm os.FileMode) error {
 	return os.Mkdir(path, perm)
 }
