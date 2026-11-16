@@ -4,6 +4,48 @@ Stage 2 landed: parallel apply + memoization stack. Measured ~1.1× on the
 interleaved worst-case bench, larger on real-shape tars (TBD, see below).
 This file lists what to try next, ranked, with the evidence so far.
 
+## 0. Bench tar-shape experiment (done 2026-11-16 — result: STOP code work)
+
+Recreated bench (`/tmp/opencode/apply-bench`, interleaved vs grouped
+shapes, 2 KiB files, best-of-3/5, 12-core Ryzen 5 7535U, /tmp tmpfs).
+Sequential runs only (parallel invocations invalidate results).
+
+| shape | n | stock | patched | delta |
+|---|---|---|---|---|
+| interleaved | 20k | 1.400 s | 1.733 s | patched −19% |
+| grouped | 20k | 1.054 s | 1.104 s | patched −5% |
+| grouped | 50k | 2.72 s | 2.92 s | patched −7% |
+| grouped | 100k | 6.25 s | 6.97 s | patched −11% |
+| interleaved | 100k | (cut) | (cut) | — |
+
+One 100k paired run (invoked in parallel, CPU-contended — indicative only):
+stock 8.04 s vs patched 7.64 s (+5%) — did not reproduce when run
+sequentially. Conclusion: **the earlier ~1.1× result does not reproduce on
+this machine.** Grouped shape does NOT unlock the parallel win (pool fills
+but per-file overhead of pool + buffer copy outweighs it here). Per the
+stage-next decision rule: remaining time is decompress+parse and fixed
+serial costs → **shift effort to ops-level levers (zstd, cache mounts,
+pnpm store layer) and stop code work** on the apply path.
+
+Caveats: synthetic bench, warm dcache, tmpfs. A real-layer run (item 1)
+could still revise this — but the burden of proof is now on showing the
+patch wins anywhere before keeping it.
+
+## 0b. CI/CD: image publish to GHCR (added)
+
+`.github/workflows/image-publish.yml`:
+- Trigger: every `v*` tag push + manual dispatch.
+- Builds Dockerfile target `buildkitd` (multi-arch: amd64+arm64 via QEMU).
+- Pushes to `ghcr.io/<owner>/<repo>` with tags: semver `{{version}}`,
+  `{{major}}.{{minor}}`, `latest` (tag builds only).
+- Push only on tag events; dispatch = local load (dry-run).
+- Uses `GITHUB_TOKEN` (packages: write) — no extra secrets needed.
+- GHA cache scoped to `image`.
+
+First publish makes the package private-by-default; flip
+`ghcr.io/<owner>/<repo>` → Public in repo → Packages settings if wanted.
+
+
 ## 0. Bench tar-shape experiment (do first — cheap, decides priorities)
 
 Current bench (`/tmp/opencode/apply-bench/main.go`) writes 3 dir entries
