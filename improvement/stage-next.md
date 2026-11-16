@@ -4,6 +4,36 @@ Stage 2 landed: parallel apply + memoization stack. Measured ~1.1× on the
 interleaved worst-case bench, larger on real-shape tars (TBD, see below).
 This file lists what to try next, ranked, with the evidence so far.
 
+## 0c. dirfd + openat2 prototype (done 2026-11-16 — result: 2.6–2.8×, MAJOR)
+
+Follow-up to sysprobe findings (§0a below). Hypothesis: path resolution
+(per-entry Lstat walk + absolute open) dominates, not syscalls per se.
+Prototype: minimal apply with `O_PATH` dirfd cache per parent dir,
+`openat2(RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS)` relative opens,
+`fchownat/futimesat AT_EMPTY_PATH`, `mkdirat/openat2` — single-threaded,
+~150 lines (`/tmp/opencode/dirfd-apply`, uncommitted). Regular files +
+dirs only, no whiteouts/symlinks/hardlinks/devices.
+
+| test | stock | dirfd prototype | speedup |
+|---|---|---|---|
+| 20k grouped | 1.159 s | 0.440 s | 2.64× |
+| 100k grouped | 6.02 s | 2.25 s | 2.67× |
+| 20k interleaved | 1.357 s | 0.491 s | 2.77× |
+
+~22 µs/file constant, matches sysprobe prediction (resolution ≈19 µs
+removed). Single-threaded — parallelism not even needed. Kernel 6.18
+(WSL2), tmpfs, warm dcache.
+
+**This invalidates the stage-1/2 direction: a single-threaded dirfd apply
+beats the parallel worker pool by ~2.5× on the same bench.** Next step:
+production patch in vendored `pkg/archive` (whiteouts via unlinkat,
+hardlinks via linkat, symlinks, ENOSYS fallback, full TestBreakouts).
+
+Bugs during prototype: sync.Mutex self-deadlock in recursive
+`get()` (non-reentrant) — fixed with `getLocked` internal recursion.
+
+## 0b. CI/CD: image publish to GHCR (added)
+
 ## 0. Bench tar-shape experiment (done 2026-11-16 — result: STOP code work)
 
 Recreated bench (`/tmp/opencode/apply-bench`, interleaved vs grouped
@@ -30,6 +60,23 @@ pnpm store layer) and stop code work** on the apply path.
 Caveats: synthetic bench, warm dcache, tmpfs. A real-layer run (item 1)
 could still revise this — but the burden of proof is now on showing the
 patch wins anywhere before keeping it.
+
+Verdict: openat2 + dirfd cache worth investigating → see §0c.
+
+## 0a. Cost-layer probe (done 2026-11-16 — evidence for §0c)
+
+No strace available (no sudo). Isolated cost layers directly
+(`/tmp/opencode/sysprobe`, 20k files, 2 KiB, warm tmpfs):
+
+| layer | µs/file | share of ~53 µs apply wall |
+|---|---|---|
+| tar parse (headers+discard) | 3.1 | ~6% |
+| raw apply syscalls (open/write/fchmod/fchownat/futimesat/close) | 14.5 | ~27% |
+| path resolution (4×Lstat + full-path open) | 18.7 | ~35% |
+| remainder (buffers, maps, tar.Reader, GC) | ~17 | ~31% |
+
+Caveats: pre-existing warm tree, no whiteouts/RootPath. Order of
+magnitude held through prototype (§0c).
 
 ## 0b. CI/CD: image publish to GHCR (added)
 
