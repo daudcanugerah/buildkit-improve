@@ -210,6 +210,15 @@ func applyNaive(ctx context.Context, root string, r io.Reader, options ApplyOpti
 
 	setApplyUmask()
 
+	// dirfd fast path: cache O_PATH fds per directory and apply entries
+	// with *at()/openat2() relative opens. Falls back transparently to the
+	// path-based serial path when openat2 is unavailable (kernel < 5.6).
+	var dcache *dirfdCache
+	if dc, derr := newDirfdCache(root); derr == nil {
+		dcache = dc
+		defer dc.closeAll()
+	}
+
 	if convertWhiteout == nil {
 		// handle whiteout by removing the target files
 		convertWhiteout = func(hdr *tar.Header, path string) (bool, error) {
@@ -256,6 +265,17 @@ func applyNaive(ctx context.Context, root string, r io.Reader, options ApplyOpti
 				originalBase := base[len(whiteoutPrefix):]
 				originalPath := filepath.Join(dir, originalBase)
 
+				// The lexical path may traverse symlinks whose raw targets
+				// point outside root (absolute archive symlink names); the
+				// removal must hit the in-root location. Resolve the
+				// canonical parent through the dirfd cache when available.
+				if dcache != nil && dcache.openat2OK {
+					if pfd, perr := dcache.get(relFromRoot(root, dir)); perr == nil {
+						if canonical, rerr := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", pfd)); rerr == nil {
+							originalPath = filepath.Join(canonical, originalBase)
+						}
+					}
+				}
 				return false, os.RemoveAll(originalPath)
 			}
 
@@ -273,6 +293,7 @@ func applyNaive(ctx context.Context, root string, r io.Reader, options ApplyOpti
 		data   []byte
 		buf    *[]byte // pooled buffer backing data; returned to bufPool
 		noSame bool
+		df     int // cached parent dir fd (dirfd fast path); -1 when unused
 	}
 	files := make(chan fileEntry, nworkers*2)
 	var wg sync.WaitGroup
@@ -286,6 +307,11 @@ func applyNaive(ctx context.Context, root string, r io.Reader, options ApplyOpti
 		if err := egctx.Err(); err != nil {
 			return err
 		}
+		if e.df >= 0 && dcache != nil {
+			// dirfd fast path: apply relative to the cached parent fd.
+			// e.path remains the fallback for metadata ops and errors.
+			return createTarFileAt(egctx, e.df, filepath.Base(e.path), e.path, root, e.hdr, bytes.NewReader(e.data), e.noSame, dcache)
+		}
 		// Overwrite semantics, same as the serial path: remove any existing
 		// entry that is not a directory being merged.
 		if fi, err := os.Lstat(e.path); err == nil {
@@ -295,7 +321,7 @@ func applyNaive(ctx context.Context, root string, r io.Reader, options ApplyOpti
 				}
 			}
 		}
-		return createTarFile(egctx, e.path, root, e.hdr, bytes.NewReader(e.data), e.noSame)
+		return createTarFile(egctx, e.path, root, e.hdr, bytes.NewReader(e.data), e.noSame, dcache)
 	}
 	worker := func() error {
 		defer wg.Done()
@@ -306,11 +332,22 @@ func applyNaive(ctx context.Context, root string, r io.Reader, options ApplyOpti
 		}
 		return nil
 	}
-	for i := 0; i < nworkers; i++ {
-		wg.Add(1)
-		eg.Go(func() error {
-			return worker()
-		})
+	// poolStarted guards lazy worker start: with the dirfd fast path the
+	// fallback pool usually never receives an entry, and spinning up +
+	// tearing down workers per drain() showed as futex/schedule overhead
+	// in profiles of dir-heavy tars.
+	poolStarted := false
+	ensurePool := func() {
+		if poolStarted {
+			return
+		}
+		poolStarted = true
+		for i := 0; i < nworkers; i++ {
+			wg.Add(1)
+			eg.Go(func() error {
+				return worker()
+			})
+		}
 	}
 	// send dispatches a file entry to the pool; drain waits until every
 	// dispatched entry has been applied, restoring a serial point.
@@ -319,6 +356,7 @@ func applyNaive(ctx context.Context, root string, r io.Reader, options ApplyOpti
 		if sendErr != nil {
 			return sendErr
 		}
+		ensurePool()
 		select {
 		case files <- e:
 			return nil
@@ -328,16 +366,14 @@ func applyNaive(ctx context.Context, root string, r io.Reader, options ApplyOpti
 		}
 	}
 	drain := func() {
+		if !poolStarted {
+			return
+		}
 		close(files)
 		wg.Wait()
 		sendErr = nil
 		files = make(chan fileEntry, nworkers*2)
-		for i := 0; i < nworkers; i++ {
-			wg.Add(1)
-			eg.Go(func() error {
-				return worker()
-			})
-		}
+		poolStarted = false
 	}
 
 	// Iterate through the files in the archive.
@@ -383,36 +419,50 @@ func applyNaive(ctx context.Context, root string, r io.Reader, options ApplyOpti
 		// Split name and resolve symlinks for root directory.
 		ppath, base := filepath.Split(hdr.Name)
 		var rerr error
-		// fs.RootPath Lstat-walks every component of ppath to resolve
-		// symlinks; identical ppaths repeat across sibling files, so
-		// memoize the resolution. Only regular files and directories use
-		// the cache; any other entry type may introduce a symlink and
-		// must resolve for real. (TypeDir entries cannot create symlinks,
-		// and any earlier symlink entry drained the pool and stored its
-		// own resolution uncached path — but note dir entries are resolved
-		// AFTER their own drain, so a just-created symlink is already in
-		// the map if one was created under this ppath.)
+		// With the dirfd fast path, containment is enforced by the kernel
+		// at open time (RESOLVE_BENEATH/RESOLVE_IN_ROOT on cached dirfds),
+		// so the userspace symlink walk is unnecessary: ppath keeps its
+		// lexical form and the entry fd is resolved relative to root.
+		// Without it, fs.RootPath Lstat-walks every component of ppath to
+		// resolve symlinks; identical ppaths repeat across sibling files,
+		// so memoize the resolution. Only regular files and directories
+		// use the cache; any other entry type may introduce a symlink and
+		// must resolve for real.
+		useDirfd := dcache != nil && dcache.openat2OK
 		canCacheRoot := hdr.Typeflag == tar.TypeReg || hdr.Typeflag == tar.TypeDir
-		var resolved bool
-		if canCacheRoot {
-			if v, ok := parentDirs.Load("rp:" + ppath); ok {
-				ppath = v.(string)
-				resolved = true
-			}
-		}
-		if !resolved {
-			ppath, rerr = fs.RootPath(root, ppath)
-			if rerr != nil {
-				err = fmt.Errorf("failed to get root path: %w", rerr)
-				break
-			}
+		if useDirfd && (canCacheRoot || hdr.Typeflag == tar.TypeLink) {
+			// lexical path under root; kernel enforces containment
+		} else {
+			var resolved bool
 			if canCacheRoot {
-				parentDirs.Store("rp:"+ppath, ppath)
+				if v, ok := parentDirs.Load("rp:" + ppath); ok {
+					ppath = v.(string)
+					resolved = true
+				}
+			}
+			if !resolved {
+				ppath, rerr = fs.RootPath(root, ppath)
+				if rerr != nil {
+					err = fmt.Errorf("failed to get root path: %w", rerr)
+					break
+				}
+				if canCacheRoot {
+					parentDirs.Store("rp:"+ppath, ppath)
+				}
 			}
 		}
 
 		// Join to root before joining to parent path to ensure relative links are
 		// already resolved based on the root before adding to parent.
+		// With the dirfd fast path, ppath may be lexical (archive-relative)
+		// or carry a leading separator for absolute archive names like
+		// /etc/passwd (RootPath used to strip it). Anything not already
+		// under root is treated as archive-relative and joined under root;
+		// containment is enforced at open time by
+		// RESOLVE_BENEATH/RESOLVE_IN_ROOT, not by this lexical join.
+		if useDirfd && !hasPathPrefix(ppath, root) {
+			ppath = filepath.Join(root, ppath)
+		}
 		path := filepath.Join(ppath, filepath.Join("/", base))
 		if path == root {
 			log.G(ctx).Debugf("file %q ignored: resolved to root", hdr.Name)
@@ -427,9 +477,32 @@ func applyNaive(ctx context.Context, root string, r io.Reader, options ApplyOpti
 			if base == "" {
 				parentPath = filepath.Dir(path)
 			}
-			if _, cached := parentDirs.Load(parentPath); !cached {
-				if err = mkparentCached(ctx, parentPath, root, options.Parents, &parentDirs); err != nil {
-					break
+			if useDirfd {
+				// dirfd fast path: ensure the parent exists by resolving
+				// it through the dirfd cache — openat2 RESOLVE_IN_ROOT
+				// follows in-root symlinks (matching RootPath semantics)
+				// and creates missing components (mode 0755). The
+				// path-based mkparent walk would Lstat a symlink parent
+				// as non-dir (ENOTDIR) instead of resolving it.
+				if rel := relFromRoot(root, ppath); rel != "" {
+					if _, derr := dcache.get(rel); derr != nil {
+						// A dangling symlink parent (e.g. whiteout under a
+						// dead symlink path) cannot be resolved; stock
+						// behavior is a no-op removal for whiteouts under
+						// such parents, so only fail for entries that
+						// would actually be written.
+						isWhiteout := strings.HasPrefix(base, whiteoutPrefix)
+						if !isWhiteout {
+							err = fmt.Errorf("failed to ensure parent dir %q: %w", ppath, derr)
+							break
+						}
+					}
+				}
+			} else {
+				if _, cached := parentDirs.Load(parentPath); !cached {
+					if err = mkparentCached(ctx, parentPath, root, options.Parents, &parentDirs); err != nil {
+						break
+					}
 				}
 			}
 		}
@@ -469,13 +542,43 @@ func applyNaive(ctx context.Context, root string, r io.Reader, options ApplyOpti
 						err = rerr
 						break
 					}
+					// Removal invalidates cached fds under the removed
+					// path: reopened lazily on next use.
+					if dcache != nil {
+						dcache.invalidateChildren(relFromRoot(root, path))
+					}
+				} else if dcache != nil {
+					// dir-over-dir merge: dir was replaced? No — merge
+					// keeps it, but the Lstat'd dir could have replaced
+					// a prior non-dir; keep cache consistent anyway.
+					dcache.invalidate(relFromRoot(root, path))
 				}
+			} else if serr != nil && os.IsNotExist(serr) && dcache != nil && hdr.Typeflag == tar.TypeDir {
+				// no existing entry: ensure cache reflects the dir we will
+				// create via the serial path below.
+				dcache.invalidate(relFromRoot(root, path))
 			}
 		}
 
-		// Regular files within maxBufEntrySize are applied by the worker
-		// pool from a pooled buffer; everything else applies inline with
-		// the original serial semantics.
+		// Regular files are applied via createTarFileAt when the dirfd
+		// fast path is available: streamed directly from the tar reader
+		// (no pooling, no buffer copy), resolution is dirfd-relative.
+		// The worker pool is skipped entirely on this path — the dirfd
+		// apply removes the syscall cost the pool parallelized, and the
+		// measured pool overhead (channel + buffer copy) exceeded its
+		// benefit here.
+		if hdr.Typeflag == tar.TypeReg && hdr.Size <= maxBufEntrySize && dcache != nil && dcache.openat2OK {
+			if df, derr := dcache.get(relFromRoot(root, ppath)); derr == nil {
+				if cerr := createTarFileAt(ctx, df, filepath.Base(path), path, root, hdr, tr, options.NoSameOwner, dcache); cerr != nil {
+					err = cerr
+					break
+				}
+				unpackedPaths[path] = struct{}{}
+				continue
+			}
+		}
+
+		// Fallback (no openat2 / dirfd error): pooled worker path.
 		if hdr.Typeflag == tar.TypeReg && hdr.Size <= maxBufEntrySize {
 			buf := bufPool.Get().(*[]byte)
 			data := (*buf)[:hdr.Size]
@@ -484,7 +587,7 @@ func applyNaive(ctx context.Context, root string, r io.Reader, options ApplyOpti
 				err = rerr
 				break
 			}
-			e := fileEntry{hdr: hdr, path: path, data: data, buf: buf, noSame: options.NoSameOwner}
+			e := fileEntry{hdr: hdr, path: path, data: data, buf: buf, noSame: options.NoSameOwner, df: -1}
 			if serr := send(e); serr != nil {
 				bufPool.Put(buf)
 				err = serr
@@ -500,9 +603,16 @@ func applyNaive(ctx context.Context, root string, r io.Reader, options ApplyOpti
 		srcData := io.Reader(tr)
 		srcHdr := hdr
 
-		if cerr := createTarFile(ctx, path, root, srcHdr, srcData, options.NoSameOwner); cerr != nil {
+		if cerr := createTarFile(ctx, path, root, srcHdr, srcData, options.NoSameOwner, dcache); cerr != nil {
 			err = cerr
 			break
+		}
+		if dcache != nil && hdr.Typeflag != tar.TypeReg {
+			// Serial-applied non-regular entries may have replaced a path
+			// component (symlink-over-dir breakout defense); refresh the
+			// cached fd for the applied path itself. Parent fds remain
+			// valid: parents were resolved via RootPath before apply.
+			dcache.invalidate(relFromRoot(root, path))
 		}
 
 		// Directory mtimes must be handled at the end to avoid further
@@ -542,8 +652,82 @@ func applyNaive(ctx context.Context, root string, r io.Reader, options ApplyOpti
 	return size, nil
 }
 
+// createTarFileAt is the dirfd fast path of createTarFile for regular
+// files. df is the O_PATH fd of the (validated) parent directory; base
+// is the entry's base name. The file is created with openat2
+// (RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS) so the kernel enforces
+// containment, and all metadata is applied via fd-relative calls.
+// Metadata fallbacks use path for kernels/filesystems lacking the *at
+// variants. Semantics match createTarFile for TypeReg entries.
+func createTarFileAt(ctx context.Context, df int, base, path, extractDir string, hdr *tar.Header, reader io.Reader, noSameOwner bool, dcache *dirfdCache) error {
+	mode := uint32(hdr.Mode & 0o7777)
 
-func createTarFile(ctx context.Context, path, extractDir string, hdr *tar.Header, reader io.Reader, noSameOwner bool) error {
+	// Canonical path for metadata fallbacks: the dirfd is the
+	// RESOLVE_IN_ROOT-resolved parent, so /proc/self/fd/<df>/base is the
+	// real on-disk location even when `path` traverses symlinks whose
+	// raw targets point outside root (absolute archive symlink names).
+	if resolved, rerr := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", df)); rerr == nil {
+		path = filepath.Join(resolved, base)
+	}
+
+	fd, _, err := openAtFile(df, base, mode, dcache.openat2OK)
+	if err != nil {
+		return err
+	}
+	f := os.NewFile(uintptr(fd), path)
+	_, err = copyBuffered(ctx, f, reader)
+	if err1 := f.Close(); err == nil {
+		err = err1
+	}
+	if err != nil {
+		return err
+	}
+
+	if !noSameOwner {
+		if err := lchownAt(fd, path, hdr.Uid, hdr.Gid); err != nil {
+			return fmt.Errorf("failed to Lchown %q for UID %d, GID %d: %w", path, hdr.Uid, hdr.Gid, err)
+		}
+	}
+
+	for key, value := range hdr.PAXRecords {
+		if strings.HasPrefix(key, paxSchilyXattr) {
+			key = key[len(paxSchilyXattr):]
+			if err := setxattrAt(fd, key, value, path); err != nil {
+				if errors.Is(err, syscall.EPERM) && strings.HasPrefix(key, userXattrPrefix) {
+					// Only regular files and directories can carry user.*
+					// xattrs; other types fall back to the serial warn+skip.
+					log.G(ctx).Warnf("ignored xattr %s in archive", key)
+					continue
+				}
+				if errors.Is(err, syscall.ENOTSUP) {
+					log.G(ctx).Warnf("ignored xattr %s in archive", key)
+					continue
+				}
+				return fmt.Errorf("failed to setxattr %q for key %q: %w", path, key, err)
+			}
+		}
+	}
+
+	// chmod after chown (chown may clear setuid/setgid bits); fchmod is
+	// not umasked by the kernel, so no umask compensation is needed.
+	if err := lchmodAt(fd, path, mode); err != nil {
+		return err
+	}
+
+	atime := boundTime(latestTime(hdr.AccessTime, hdr.ModTime))
+	mtime := boundTime(hdr.ModTime)
+	return chtimesAt(fd, path, atime.UnixNano(), mtime.UnixNano())
+}
+
+// hasPathPrefix reports whether path is root itself or lies under root.
+func hasPathPrefix(path, root string) bool {
+	if path == root {
+		return true
+	}
+	return len(path) > len(root) && path[:len(root)] == root && os.IsPathSeparator(path[len(root)])
+}
+
+func createTarFile(ctx context.Context, path, extractDir string, hdr *tar.Header, reader io.Reader, noSameOwner bool, dcache *dirfdCache) error {
 	// hdr.Mode is in linux format, which we can use for syscalls,
 	// but for os.Foo() calls we need the mode converted to os.FileMode,
 	// so use hdrInfo.Mode() (they differ for e.g. setuid bits)
@@ -555,6 +739,7 @@ func createTarFile(ctx context.Context, path, extractDir string, hdr *tar.Header
 		// In that case we just want to merge the two
 		if fi, err := os.Lstat(path); err != nil || !fi.IsDir() {
 			if err := mkdir(path, hdrInfo.Mode()); err != nil {
+				fmt.Fprintf(os.Stderr, "DBG mkdir path=%q ppath=%q base=%q name=%q\n", path, extractDir, filepath.Base(path), hdr.Name)
 				return err
 			}
 		}
@@ -592,6 +777,19 @@ func createTarFile(ctx context.Context, path, extractDir string, hdr *tar.Header
 			return err
 		}
 
+		// link(2) does not follow a symlink at the final component of
+		// newpath, but the LEXICAL path may still traverse symlinks in
+		// intermediate components whose raw targets point outside root
+		// (absolute archive symlink names). Resolve the canonical parent
+		// from the dirfd cache instead when available.
+		if dcache != nil && dcache.openat2OK {
+			if pfd, perr := dcache.get(relFromRoot(extractDir, filepath.Dir(path))); perr == nil {
+				canonical, rerr := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", pfd))
+				if rerr == nil {
+					path = filepath.Join(canonical, filepath.Base(path))
+				}
+			}
+		}
 		if err := link(targetPath, path); err != nil {
 			return err
 		}
