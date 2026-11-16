@@ -385,10 +385,14 @@ func applyNaive(ctx context.Context, root string, r io.Reader, options ApplyOpti
 		var rerr error
 		// fs.RootPath Lstat-walks every component of ppath to resolve
 		// symlinks; identical ppaths repeat across sibling files, so
-		// memoize the resolution. Only regular files use the cache;
-		// any other entry type may introduce a symlink and must resolve
-		// for real.
-		canCacheRoot := hdr.Typeflag == tar.TypeReg
+		// memoize the resolution. Only regular files and directories use
+		// the cache; any other entry type may introduce a symlink and
+		// must resolve for real. (TypeDir entries cannot create symlinks,
+		// and any earlier symlink entry drained the pool and stored its
+		// own resolution uncached path — but note dir entries are resolved
+		// AFTER their own drain, so a just-created symlink is already in
+		// the map if one was created under this ppath.)
+		canCacheRoot := hdr.Typeflag == tar.TypeReg || hdr.Typeflag == tar.TypeDir
 		var resolved bool
 		if canCacheRoot {
 			if v, ok := parentDirs.Load("rp:" + ppath); ok {
@@ -424,10 +428,9 @@ func applyNaive(ctx context.Context, root string, r io.Reader, options ApplyOpti
 				parentPath = filepath.Dir(path)
 			}
 			if _, cached := parentDirs.Load(parentPath); !cached {
-				if err = mkparent(ctx, parentPath, root, options.Parents); err != nil {
+				if err = mkparentCached(ctx, parentPath, root, options.Parents, &parentDirs); err != nil {
 					break
 				}
-				parentDirs.Store(parentPath, struct{}{})
 			}
 		}
 
@@ -455,11 +458,17 @@ func applyNaive(ctx context.Context, root string, r io.Reader, options ApplyOpti
 		// The only exception is when it is a directory *and* the file from
 		// the layer is also a directory. Then we want to merge them (i.e.
 		// just apply the metadata from the layer).
-		if fi, serr := os.Lstat(path); serr == nil {
-			if !fi.IsDir() || hdr.Typeflag != tar.TypeDir {
-				if rerr := os.RemoveAll(path); rerr != nil {
-					err = rerr
-					break
+		//
+		// For dispatched regular files this check is left to the worker
+		// (it runs in applyFile); doing it here as well would duplicate
+		// the Lstat+RemoveAll on every small file.
+		if hdr.Typeflag != tar.TypeReg || hdr.Size > maxBufEntrySize {
+			if fi, serr := os.Lstat(path); serr == nil {
+				if !fi.IsDir() || hdr.Typeflag != tar.TypeDir {
+					if rerr := os.RemoveAll(path); rerr != nil {
+						err = rerr
+						break
+					}
 				}
 			}
 		}
@@ -696,6 +705,31 @@ func mkparent(ctx context.Context, path, root string, parents []string) error {
 
 	log.G(ctx).Debugf("parent directory %q not found: default permissions(0755) used", path)
 
+	return nil
+}
+
+// mkparentCached is mkparent with an existence memo for every directory it
+// proves (not just the leaf). Sibling entries under the same tree skip the
+// whole Lstat walk, which otherwise recurses per level per entry.
+func mkparentCached(ctx context.Context, path, root string, parents []string, memo *sync.Map) error {
+	if _, ok := memo.Load(path); ok {
+		return nil
+	}
+	if err := mkparent(ctx, path, root, parents); err != nil {
+		return err
+	}
+	// path and every ancestor between root and path now exists as a dir.
+	memo.Store(path, struct{}{})
+	for i := len(path); i > len(root)+1; {
+		for i > len(root) && !os.IsPathSeparator(path[i-1]) {
+			i--
+		}
+		if i <= len(root)+1 {
+			break
+		}
+		memo.Store(path[:i-1], struct{}{})
+		i-- // step past the separator to length of the parent
+	}
 	return nil
 }
 
