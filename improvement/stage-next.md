@@ -4,6 +4,89 @@ Stage 2 landed: parallel apply + memoization stack. Measured ~1.1× on the
 interleaved worst-case bench, larger on real-shape tars (TBD, see below).
 This file lists what to try next, ranked, with the evidence so far.
 
+## 0d. Stage 4 shipped + image artifacts (done 2026-11-16)
+
+Stage 4 (dirfd + openat2 production patch) landed as commit `4d3ae06`
+— full technical write-up in `stage-4.md`. Summary:
+
+**Mechanism (what changed and why):**
+
+1. **`dirfd_cache_unix.go` (new)** — `O_PATH` dirfd cache keyed by
+   archive-relative directory path. Whole-path resolution in ONE
+   `openat2(RESOLVE_IN_ROOT)` syscall replaces the userspace
+   `fs.RootPath` Lstat-walk (depth × stat per entry). `RESOLVE_IN_ROOT`
+   = kernel-enforced chroot semantics: in-root symlinks followed,
+   escapes clamped — same guarantee as RootPath, O(1) syscalls.
+   ENOENT → component-wise `mkdirat` walk (0755) + re-resolve.
+2. **Regular files (≤1 MiB)** — `openat2(RESOLVE_BENEATH|NO_SYMLINKS)`
+   with `O_CREAT|O_TRUNC|O_NOFOLLOW`, mode in `OpenHow.Mode` (kernel does
+   NOT umask openat2 mode → no compensating chmod). Payload streamed
+   directly from the tar reader — no pooled buffer copy. Metadata via
+   `fchownat(fd,"",AT_EMPTY_PATH)`, `fchmod(fd)`,
+   `utimensat(fd,"",AT_EMPTY_PATH)` — zero path resolution.
+3. **Lazy worker pool** — the fast path applies inline; the stage-1/2
+   pool starts only if the fallback dispatches. Profiling the first
+   integration attempt showed `futex` 20% + `schedule` 17% CPU: the pool
+   was torn down and respawned on EVERY dir entry (`drain()` barrier,
+   2500 dirs × 8 workers). Lazy start eliminated it.
+4. **Canonical-path fallbacks** — raw symlink targets in archives can be
+   absolute (`tc.Symlink("/etc", "localetc")` → on-disk link target is
+   HOST `/etc`). Stock code was safe because it applied everything
+   through RootPath-resolved paths. The dirfd path resolves through the
+   symlink IN-ROOT (kernel clamp), but any path-based metadata op
+   (`lchown`, `link`, `RemoveAll` whiteouts) traverses the raw host
+   target. Fix: resolve the real on-disk location once via
+   `os.Readlink("/proc/self/fd/<df>")` + base name, use that for all
+   path-based ops. This closed: hardlink EXDEV, whiteout no-op misses,
+   metadata ENOENT, and prevents accidentally touching host files.
+5. **ENOSYS fallback** — probe `openat2` once at cache init (kernel
+   <5.6); on failure the whole apply uses the stock serial/pool path.
+
+**Measured (12-core WSL2, 2-CPU cgroup quota, tmpfs, taskset-pinned,
+best-of-5, sequential A/B — stock v2.4.2 vs patched):**
+
+| test | stock | patched | speedup |
+|---|---|---|---|
+| 20k files, grouped | 1.067 s | 0.725 s | 1.47× |
+| 20k files, interleaved | 1.272 s | 0.852 s | 1.49× |
+| 100k files, grouped | 5.484 s | 4.056 s | 1.35× |
+| 100k files, interleaved | 7.025 s | 4.447 s | 1.58× |
+
+Gap vs prototype (2.6×): production retains whiteout/hardlink/xattr/
+opaque-dir semantics, per-entry filter, dirs tail-pass, and canonical
+path resolution — the prototype skipped all of that. Remaining serial
+costs: tar parse (~6%), apply syscalls (~27% — now fd-relative), buffer
++ map + reader overhead (~30%).
+
+**Correctness:** full containerd archive suite (`tar_test.go`,
+`tar_unix_test.go` v2.4.2), `-race -count=3`: all pass, including every
+`TestBreakouts` escape case (SymlinkAbsolute, SymlinkUpAndOut,
+HardlinkDownAndOut, WhiteoutDeadSymlinkParent, ...),
+`TestRepeatedOpaqueWhiteout`, `TestWhiteoutSymlinkPath`, `TestDiffApply`
+fstest suite. 7 semantic bugs found and fixed during integration
+(listed in `stage-4.md`).
+
+**Artifacts:**
+
+- Image `docker.io/daudcanugerah/buildkit-base:patch-1.2`
+  (digest `sha256:2221230d...`) — buildkitd from `main` incl. stage 4.
+  `patch-1` was stages 1–2 only.
+- CI: `.github/workflows/image-publish.yml` (GHCR) + Docker Hub
+  workflow; tag-triggered `v*` + manual dispatch.
+- Bench (persistent): `~/office/bench/apply-bench{,-stock}` — `-n -iters
+  -shape grouped|interleaved`. Stock binary replaces containerd to the
+  pristine module cache copy.
+
+**Next when resuming:**
+
+1. Real-layer benchmark (actual pnpm/npm layer blob) — validates 1.35×+
+   against production shape and sizes (median file size, dir grouping).
+2. Upstream PR to containerd `pkg/archive` — vendored patch dies on next
+   bump; stage-{1..4}.md + the numbers above are the PR body.
+3. Optional: extend fast path to whiteout `unlinkat` + hardlink `linkat`
+   (currently only file create + metadata are fd-relative; removals and
+   links canonicalize via `/proc/self/fd` — one extra readlink each).
+
 ## 0c. dirfd + openat2 prototype (done 2026-11-16 — result: 2.6–2.8×, MAJOR)
 
 Follow-up to sysprobe findings (§0a below). Hypothesis: path resolution
